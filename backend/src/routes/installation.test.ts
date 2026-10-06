@@ -55,6 +55,38 @@ describe('Installation Provider Routes', () => {
     };
   }
 
+  function createKaitoProviderConfigWithLegacyValues() {
+    const installation = JSON.parse(
+      mockInferenceProviderConfig.metadata.annotations['airunway.ai/installation'],
+    );
+    installation.helmCharts[0].values = {
+      'featureGates.disableNodeAutoProvisioning': false,
+      'nvidiaDevicePlugin.enabled': true,
+      'localCSIDriver.useLocalCSIDriver': true,
+      'gpu-feature-discovery.nfd.enabled': true,
+      'gpu-feature-discovery.gfd.enabled': true,
+      featureGates: { legacyOption: 'kept' },
+      nvidiaDevicePlugin: { legacyOption: 'kept' },
+      localCSIDriver: { legacyOption: 'kept' },
+      'gpu-feature-discovery': {
+        nfd: { enabled: true, legacyOption: 'kept' },
+        gfd: { enabled: true, legacyOption: 'kept' },
+      },
+      customOption: true,
+    };
+
+    return {
+      ...mockInferenceProviderConfig,
+      metadata: {
+        ...mockInferenceProviderConfig.metadata,
+        annotations: {
+          ...mockInferenceProviderConfig.metadata.annotations,
+          'airunway.ai/installation': JSON.stringify(installation),
+        },
+      },
+    };
+  }
+
   function createDynamoProviderConfigWithNestedValues() {
     return {
       ...mockInferenceProviderConfig,
@@ -330,9 +362,10 @@ describe('Installation Provider Routes', () => {
       expect(data.version).toBe('1.2.3');
       expect(data.message).toBe('Dynamo CRD not found');
       expect(data.helmCommands).toHaveLength(1);
-      expect(data.helmCommands[0]).toContain('helm install dynamo-platform https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.0.1.tgz');
-      expect(data.helmCommands[0]).not.toContain('--skip-crds');
-      expect(data.helmCommands[0]).not.toContain('--force-conflicts');
+      expect(data.helmCommands[0]).toContain('helm pull https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.0.1.tgz');
+      expect(data.helmCommands[0]).toContain('helm template');
+      expect(data.helmCommands[0]).toContain('--skip-crds');
+      expect(data.helmCommands[0]).toContain('--force-conflicts');
       expect(data.helmCommands[0]).toContain('global.grove.install=true');
     });
 
@@ -593,10 +626,10 @@ describe('Installation Provider Routes', () => {
       expect(data.providerId).toBe('dynamo');
       expect(data.providerName).toBe('Dynamo');
       expect(data.commands).toHaveLength(1);
-      expect(data.commands[0]).toContain('helm install dynamo-platform https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.0.1.tgz');
-      expect(data.commands[0]).not.toContain('helm pull');
-      expect(data.commands[0]).not.toContain('kubectl apply --server-side --force-conflicts -f "$crd"');
-      expect(data.commands[0]).not.toContain('--skip-crds');
+      expect(data.commands[0]).toContain('helm pull https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.0.1.tgz');
+      expect(data.commands[0]).toContain('helm template');
+      expect(data.commands[0]).toContain('kubectl apply --server-side --force-conflicts -f "$crd"');
+      expect(data.commands[0]).toContain('--skip-crds');
       expect(data.commands[0]).toContain('--post-renderer');
       expect(data.commands[0]).toContain("--set-json 'dynamo-operator=");
       expect(data.commands[0]).toContain('"tag":"v0.15.0"');
@@ -852,7 +885,7 @@ describe('Installation Provider Routes', () => {
       let installCharts: HelmChart[] = [];
 
       restores.push(
-        mockServiceMethod(kubernetesService, 'getInferenceProviderConfig', async () => mockInferenceProviderConfig),
+        mockServiceMethod(kubernetesService, 'getInferenceProviderConfig', async () => createKaitoProviderConfigWithLegacyValues()),
         mockServiceMethod(helmService, 'checkHelmAvailable', async () => ({ available: true, version: '3.14.0' })),
         mockServiceMethod(helmService, 'installProvider', async (_repos, charts) => {
           installCharts = charts;
@@ -874,13 +907,26 @@ describe('Installation Provider Routes', () => {
       expect(installCharts[0].preInstallMissingCrds).toBe(true);
       expect(installCharts[0].skipCrds).toBe(true);
       expect(installCharts[0].keepCrdResources).toBe(true);
-      expect(installCharts[0].values).toMatchObject({
-        'featureGates.disableNodeAutoProvisioning': true,
-        'nvidiaDevicePlugin.enabled': false,
-        'localCSIDriver.useLocalCSIDriver': false,
-        'gpu-feature-discovery.nfd.enabled': false,
-        'gpu-feature-discovery.gfd.enabled': false,
+      const values = installCharts[0].values || {};
+      expect(values).toMatchObject({
+        featureGates: { disableNodeAutoProvisioning: true, legacyOption: 'kept' },
+        nvidiaDevicePlugin: { enabled: false, legacyOption: 'kept' },
+        localCSIDriver: { useLocalCSIDriver: false, legacyOption: 'kept' },
+        'gpu-feature-discovery': {
+          nfd: { enabled: false, legacyOption: 'kept' },
+          gfd: { enabled: false, legacyOption: 'kept' },
+        },
+        customOption: true,
       });
+      for (const legacyKey of [
+        'featureGates.disableNodeAutoProvisioning',
+        'nvidiaDevicePlugin.enabled',
+        'localCSIDriver.useLocalCSIDriver',
+        'gpu-feature-discovery.nfd.enabled',
+        'gpu-feature-discovery.gfd.enabled',
+      ]) {
+        expect(Object.hasOwn(values, legacyKey)).toBe(false);
+      }
     });
 
     test('uses Helm dependency CRD installation and preserves managed CRDs for Dynamo', async () => {
@@ -904,8 +950,9 @@ describe('Installation Provider Routes', () => {
 
       expect(installCharts).toHaveLength(1);
       expect(installCharts[0].chart).toBe('https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.0.1.tgz');
-      expect(installCharts[0].preInstallMissingCrds).toBeUndefined();
-      expect(installCharts[0].skipCrds).toBeUndefined();
+      expect(installCharts[0].preInstallMissingCrds).toBe(true);
+      expect(installCharts[0].includeSubchartCrds).toBe(true);
+      expect(installCharts[0].skipCrds).toBe(true);
       expect(installCharts[0].keepCrdResources).toBe(true);
       expect(installCharts[0]).not.toHaveProperty('forceConflicts');
       expect(installCharts[0].values?.['global.grove.install']).toBe(true);

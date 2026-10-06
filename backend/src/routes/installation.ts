@@ -132,22 +132,77 @@ function selectGpuForEstimate(
 }
 
 const KAITO_BYO_NODE_VALUES: Record<string, unknown> = {
-  'featureGates.disableNodeAutoProvisioning': true,
-  'nvidiaDevicePlugin.enabled': false,
-  'localCSIDriver.useLocalCSIDriver': false,
-  'gpu-feature-discovery.nfd.enabled': false,
-  'gpu-feature-discovery.gfd.enabled': false,
+  featureGates: { disableNodeAutoProvisioning: true },
+  nvidiaDevicePlugin: { enabled: false },
+  localCSIDriver: { useLocalCSIDriver: false },
+  'gpu-feature-discovery': {
+    nfd: { enabled: false },
+    gfd: { enabled: false },
+  },
 };
+
+const LEGACY_KAITO_VALUE_KEYS = [
+  'featureGates.disableNodeAutoProvisioning',
+  'nvidiaDevicePlugin.enabled',
+  'localCSIDriver.useLocalCSIDriver',
+  'gpu-feature-discovery.nfd.enabled',
+  'gpu-feature-discovery.gfd.enabled',
+];
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function withKaitoByoNodeValues(values?: Record<string, unknown>): Record<string, unknown> {
+  const existing = { ...values };
+  for (const key of LEGACY_KAITO_VALUE_KEYS) {
+    delete existing[key];
+  }
+
+  const gpuFeatureDiscovery = recordValue(existing['gpu-feature-discovery']);
+  return {
+    ...existing,
+    featureGates: {
+      ...recordValue(existing.featureGates),
+      ...recordValue(KAITO_BYO_NODE_VALUES.featureGates),
+    },
+    nvidiaDevicePlugin: {
+      ...recordValue(existing.nvidiaDevicePlugin),
+      ...recordValue(KAITO_BYO_NODE_VALUES.nvidiaDevicePlugin),
+    },
+    localCSIDriver: {
+      ...recordValue(existing.localCSIDriver),
+      ...recordValue(KAITO_BYO_NODE_VALUES.localCSIDriver),
+    },
+    'gpu-feature-discovery': {
+      ...gpuFeatureDiscovery,
+      nfd: {
+        ...recordValue(gpuFeatureDiscovery.nfd),
+        ...recordValue(recordValue(KAITO_BYO_NODE_VALUES['gpu-feature-discovery']).nfd),
+      },
+      gfd: {
+        ...recordValue(gpuFeatureDiscovery.gfd),
+        ...recordValue(recordValue(KAITO_BYO_NODE_VALUES['gpu-feature-discovery']).gfd),
+      },
+    },
+  };
+}
 
 function isKaitoWorkspaceChart(providerId: string, chart: ProviderHelmChartDetails): boolean {
   return providerId === 'kaito' && chart.chart === 'kaito/workspace';
 }
 
-function shouldPreInstallMissingCrds(providerId: string, chart: ProviderHelmChartDetails) {
-  return isKaitoWorkspaceChart(providerId, chart);
+function isDynamoPlatformChart(providerId: string, chart: ProviderHelmChartDetails): boolean {
+  return providerId === 'dynamo' && chart.name === 'dynamo-platform';
 }
 
-type ProviderInstallChart = ProviderHelmChartDetails & Pick<HelmChart, 'keepCrdResources'>;
+function shouldPreInstallMissingCrds(providerId: string, chart: ProviderHelmChartDetails) {
+  return isKaitoWorkspaceChart(providerId, chart) || isDynamoPlatformChart(providerId, chart);
+}
+
+type ProviderInstallChart = ProviderHelmChartDetails & Pick<HelmChart, 'includeSubchartCrds' | 'keepCrdResources'>;
 
 function normalizeInstallCharts(
   providerId: string,
@@ -160,11 +215,12 @@ function normalizeInstallCharts(
           ...chart,
           preInstallMissingCrds: true,
           skipCrds: true,
+          ...(isDynamoPlatformChart(providerId, chart) ? { includeSubchartCrds: true } : {}),
           // Keep legacy provider annotations safe until the shim refreshes
           // them. The chart's dependency conditions must be disabled in the
           // same profile used by the Go shim and the Makefile.
           ...(isKaitoWorkspaceChart(providerId, chart)
-            ? { values: { ...chart.values, ...KAITO_BYO_NODE_VALUES } }
+            ? { values: withKaitoByoNodeValues(chart.values) }
             : {}),
         }
       : { ...chart };
@@ -643,8 +699,18 @@ const installation = new Hono()
     logger.info({ providerId }, `Uninstalling ${provider.name}`);
     const results: Array<{ step: string; success: boolean; output: string; error?: string }> = [];
 
-    for (const chart of [...provider.helmCharts].reverse()) {
-      const result = await helmService.uninstall(chart.name, chart.namespace);
+    const uninstallCharts = normalizeInstallCharts(
+      providerId,
+      provider.helmCharts,
+      provider.requiresCRD ?? true,
+    );
+    for (const chart of [...uninstallCharts].reverse()) {
+      const result = await helmService.uninstall(chart.name, chart.namespace, {
+        requireKeptCrdResources: Boolean(chart.keepCrdResources),
+        requiredKeptCrdNames: providerId === 'kaito' && chart.chart === 'kaito/workspace'
+          ? crdNames
+          : [],
+      });
       results.push({
         step: `uninstall-${chart.name}`,
         success: result.success,

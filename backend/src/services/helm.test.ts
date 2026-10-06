@@ -1,8 +1,16 @@
+import { spawnSync } from 'child_process';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { fileURLToPath } from 'url';
 import { describe, test, expect, afterEach } from 'bun:test';
 import type { HelmResult, HelmRelease, HelmRepo, HelmChart } from './helm';
-import { addKeepResourcePolicyToCrdManifest, GPU_OPERATOR_REPO, GPU_OPERATOR_CHART, helmService } from './helm';
+import {
+  addKeepResourcePolicyToCrdManifest,
+  getCrdRetentionProblems,
+  GPU_OPERATOR_REPO,
+  GPU_OPERATOR_CHART,
+  helmService,
+} from './helm';
 
 describe('HelmService - GPU Operator Constants', () => {
   test('GPU_OPERATOR_REPO has correct configuration', () => {
@@ -387,9 +395,10 @@ describe('HelmService - getInstallCommands Logic', () => {
       keepCrdResources: true,
     }])[0];
 
-    expect(command).toContain('cat > "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER"');
+    expect(command).toContain('cat > "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER/keep-crd-resources.js"');
+    expect(command).toContain('#!/usr/bin/env node');
     expect(command).toContain('helm.sh/resource-policy: keep');
-    expect(command).toContain('--post-renderer "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER"');
+    expect(command).toContain('helm install kaito-workspace kaito/workspace --namespace kaito-workspace --post-renderer "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER/keep-crd-resources.js"');
     expect(command).toContain('helm install kaito-workspace kaito/workspace');
   });
 
@@ -417,7 +426,8 @@ describe('HelmService - getInstallCommands Logic', () => {
     expect(commands[0]).toContain('kubectl get "$crd_name" --ignore-not-found -o name');
     expect(commands[0]).toContain('kubectl apply --server-side --force-conflicts -f "$crd"');
     expect(commands[0]).toContain('helm install kaito-workspace "$KAITO_WORKSPACE_CHART_PATH"');
-    expect(commands[0]).toContain('--post-renderer "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER"');
+    expect(commands[0]).toContain('#!/usr/bin/env node');
+    expect(commands[0]).toContain('--post-renderer "$KAITO_WORKSPACE_KEEP_CRD_POST_RENDERER/keep-crd-resources.js"');
     expect(commands[0]).not.toContain('helm install kaito-workspace "$KAITO_WORKSPACE_CHART_PATH" --namespace kaito-workspace --create-namespace --version');
     expect(commands[0]).toContain('--skip-crds');
   });
@@ -577,6 +587,63 @@ describe('HelmService - Managed Chart CRDs', () => {
     expect(helmCalls.some((args) => args[0] === 'upgrade')).toBe(true);
   });
 
+  test('preinstalls enabled subchart CRDs without applying template-managed CRDs', async () => {
+    const kubectlCalls: string[][] = [];
+    const helmCalls: string[][] = [];
+    const rendered = [
+      '---',
+      '# Source: dynamo-platform/charts/dynamo-operator/crds/nvidia.com_dynamoworkermetadatas.yaml',
+      'apiVersion: apiextensions.k8s.io/v1',
+      'kind: CustomResourceDefinition',
+      'metadata:',
+      '  name: dynamoworkermetadatas.nvidia.com',
+      '---',
+      '# Source: dynamo-platform/templates/managed-crd.yaml',
+      'apiVersion: apiextensions.k8s.io/v1',
+      'kind: CustomResourceDefinition',
+      'metadata:',
+      '  name: template-managed.example.com',
+    ].join('\n');
+
+    service.execute = async (args: string[]) => {
+      helmCalls.push(args);
+      if (args[0] === 'pull') {
+        const untarDir = args[args.indexOf('--untar') + 2];
+        const chartDir = join(untarDir, 'dynamo-platform');
+        mkdirSync(chartDir, { recursive: true });
+        writeFileSync(join(chartDir, 'Chart.yaml'), 'apiVersion: v2\nname: dynamo-platform\nversion: 1.1.1\n', 'utf8');
+        return { success: true, stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (args[0] === 'template') {
+        return { success: true, stdout: rendered, stderr: '', exitCode: 0 };
+      }
+      return { success: true, stdout: '', stderr: '', exitCode: 0 };
+    };
+    service.executeKubectl = async (args: string[]) => {
+      kubectlCalls.push(args);
+      return { success: true, stdout: '', stderr: '', exitCode: 0 };
+    };
+
+    const result = await helmService.installProvider([], [{
+      name: 'dynamo-platform',
+      chart: 'https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-1.1.1.tgz',
+      namespace: 'dynamo-system',
+      preInstallMissingCrds: true,
+      includeSubchartCrds: true,
+      skipCrds: true,
+      values: { 'global.grove.install': true },
+    }]);
+
+    expect(result.success).toBe(true);
+    expect(helmCalls.some((args) => args[0] === 'template'
+      && args.includes('--include-crds')
+      && args.includes('--set-json')
+      && args.includes('global.grove.install=true'))).toBe(true);
+    expect(kubectlCalls.filter((args) => args[0] === 'get').map((args) => args[2]))
+      .toEqual(['dynamoworkermetadatas.nvidia.com']);
+    expect(kubectlCalls.some((args) => args[0] === 'apply')).toBe(true);
+  });
+
   test('stops generated CRD installation when kubectl fails', () => {
     const command = helmService.getInstallCommands([], [{
       name: 'kaito-workspace',
@@ -603,11 +670,165 @@ describe('HelmService - Managed Chart CRDs', () => {
       'kind: CustomResourceDefinition',
       'metadata:',
       '  name: workspaces.kaito.sh',
+      '  annotations:',
+      '    helm.sh/resource-policy: delete',
+      '    example.com/owner: kaito',
     ].join('\n');
 
     const rendered = addKeepResourcePolicyToCrdManifest(manifest);
     expect(rendered).toContain('name: untouched');
     expect(rendered).toContain('helm.sh/resource-policy: keep');
+    expect(rendered).toContain('example.com/owner: kaito');
+    expect(getCrdRetentionProblems(rendered, ['workspaces.kaito.sh'])).toEqual([]);
+  });
+
+  test('compiled application post-renderer exits after writing the manifest', () => {
+    const entryPath = fileURLToPath(new URL('../index.ts', import.meta.url));
+    const manifest = [
+      'apiVersion: apiextensions.k8s.io/v1',
+      'kind: CustomResourceDefinition',
+      'metadata:',
+      '  name: smoke.example.com',
+      '  annotations:',
+      '    helm.sh/resource-policy: delete',
+    ].join('\n');
+    const rendered = spawnSync(process.execPath, [entryPath], {
+      input: manifest,
+      encoding: 'utf8',
+      timeout: 5000,
+      env: { ...process.env, AIRUNWAY_HELM_POST_RENDERER: 'keep-crd-resources' },
+    });
+
+    expect(rendered.status).toBe(0);
+    expect(rendered.error).toBeUndefined();
+    expect(rendered.stdout).toContain('helm.sh/resource-policy: keep');
+  });
+
+  test('runs the source CRD post-renderer through a Helm-compatible executable path', async () => {
+    const manifest = [
+      'apiVersion: apiextensions.k8s.io/v1',
+      'kind: CustomResourceDefinition',
+      'metadata:',
+      '  name: smoke.example.com',
+      '  annotations:',
+      '    helm.sh/resource-policy: delete',
+    ].join('\n');
+    const helmCalls: string[][] = [];
+    service.execute = async (args: string[]) => {
+      helmCalls.push(args);
+      const rendererIndex = args.indexOf('--post-renderer');
+      expect(rendererIndex).toBeGreaterThanOrEqual(0);
+      const rendered = spawnSync(args[rendererIndex + 1], {
+        input: manifest,
+        encoding: 'utf8',
+      });
+      expect(rendered.status).toBe(0);
+      expect(rendered.stdout).toContain('helm.sh/resource-policy: keep');
+      return { success: true, stdout: '', stderr: '', exitCode: 0 };
+    };
+
+    const result = await helmService.install({
+      name: 'kaito-workspace',
+      chart: 'kaito/workspace',
+      namespace: 'kaito-workspace',
+      keepCrdResources: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(helmCalls).toHaveLength(1);
+  });
+
+
+  test('standalone KAITO renderer overwrites CRD policy and checks release manifests', () => {
+    const rendererPath = fileURLToPath(new URL('../../../providers/kaito/keep-crd-resources.js', import.meta.url));
+    const manifest = [
+      'apiVersion: apiextensions.k8s.io/v1',
+      'kind: CustomResourceDefinition',
+      'metadata:',
+      '  name: workspaces.kaito.sh',
+      '  annotations:',
+      '    helm.sh/resource-policy: delete',
+    ].join('\n');
+    const rendered = spawnSync(process.execPath, [rendererPath], { input: manifest, encoding: 'utf8' });
+    expect(rendered.status).toBe(0);
+    expect(rendered.stdout).toContain('helm.sh/resource-policy: keep');
+
+    const verified = spawnSync(
+      process.execPath,
+      [rendererPath, '--check-kept', 'workspaces.kaito.sh'],
+      { input: rendered.stdout, encoding: 'utf8' },
+    );
+    expect(verified.status).toBe(0);
+
+    const missing = spawnSync(
+      process.execPath,
+      [rendererPath, '--check-kept', 'inferencesets.kaito.sh'],
+      { input: rendered.stdout, encoding: 'utf8' },
+    );
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain('missing from the Helm release manifest');
+  });
+
+  test('refuses Helm uninstall when release CRDs are not retained', async () => {
+    const calls: string[][] = [];
+    service.execute = async (args: string[]) => {
+      calls.push(args);
+      return {
+        success: true,
+        stdout: [
+          'apiVersion: apiextensions.k8s.io/v1',
+          'kind: CustomResourceDefinition',
+          'metadata:',
+          '  name: workspaces.kaito.sh',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      };
+    };
+
+    const result = await helmService.uninstall('kaito-workspace', 'kaito-workspace', {
+      requireKeptCrdResources: true,
+      requiredKeptCrdNames: ['workspaces.kaito.sh'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.stderr).toContain('No uninstall was attempted');
+    expect(result.stderr).toContain('Upgrade the release with the current installation profile before retrying');
+    expect(calls).toEqual([['get', 'manifest', 'kaito-workspace', '--namespace', 'kaito-workspace']]);
+  });
+
+  test('uninstalls only after every release CRD is retained', async () => {
+    const calls: string[][] = [];
+    service.execute = async (args: string[]) => {
+      calls.push(args);
+      return {
+        success: true,
+        stdout: args[0] === 'get'
+          ? [
+            'apiVersion: apiextensions.k8s.io/v1',
+            'kind: CustomResourceDefinition',
+            'metadata:',
+            '  name: workspaces.kaito.sh',
+            '  annotations:',
+            '    helm.sh/resource-policy: keep',
+          ].join('\n')
+          : 'uninstalled',
+        stderr: '',
+        exitCode: 0,
+      };
+    };
+
+    const result = await helmService.uninstall('kaito-workspace', 'kaito-workspace', {
+      requireKeptCrdResources: true,
+      requiredKeptCrdNames: ['workspaces.kaito.sh'],
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toEqual([
+      ['get', 'manifest', 'kaito-workspace', '--namespace', 'kaito-workspace'],
+      ['uninstall', 'kaito-workspace', '--namespace', 'kaito-workspace', '--wait'],
+    ]);
+
   });
 
   test('waits for Helm uninstall to finish before returning', async () => {

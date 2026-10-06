@@ -27,12 +27,43 @@ export interface HelmChart {
   fetchUrl?: string;
   preCrdUrls?: string[];
   preInstallMissingCrds?: boolean;
+  includeSubchartCrds?: boolean;
   keepCrdResources?: boolean;
+}
+
+export interface HelmUninstallOptions {
+  requireKeptCrdResources?: boolean;
+  requiredKeptCrdNames?: string[];
 }
 
 interface ChartCrdDocument {
   name: string;
   manifest: string;
+}
+
+function getSubchartCrdDocumentsFromTemplate(rendered: string): ChartCrdDocument[] {
+  const crdDocuments = new Map<string, ChartCrdDocument>();
+  const sourceBlocks = rendered.split(/(?=^# Source:\s)/m);
+  for (const block of sourceBlocks) {
+    const source = block.match(/^# Source:\s*(.+)$/m)?.[1];
+    if (!source) continue;
+    const normalizedSource = source.replace(/\\/g, '/');
+    if (!/(^|\/)charts\/.+\/crds\/[^/]+\.ya?ml$/i.test(normalizedSource)) continue;
+    for (const document of loadAll(block)) {
+      if (!document || typeof document !== 'object' || Array.isArray(document)) continue;
+      const resource = document as Record<string, unknown>;
+      if (resource.kind !== 'CustomResourceDefinition') continue;
+      const metadata = resource.metadata;
+      if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
+      const name = (metadata as Record<string, unknown>).name;
+      if (typeof name !== 'string' || !name.trim() || crdDocuments.has(name)) continue;
+      crdDocuments.set(name, {
+        name,
+        manifest: dump(resource, { noRefs: true }),
+      });
+    }
+  }
+  return Array.from(crdDocuments.values());
 }
 
 /**
@@ -71,7 +102,10 @@ function keepCrdResource(document) {
     && index < end
     && /^\s+helm\.sh\/resource-policy\s*:/.test(line)
   ));
-  if (policyIndex >= 0) return document;
+  if (policyIndex >= 0) {
+    lines[policyIndex] = '    helm.sh/resource-policy: keep';
+    return lines.join('\n');
+  }
 
   const annotationsIndex = lines.findIndex((line, index) => (
     index > metadataIndex && index < end && /^  annotations:\s*$/.test(line)
@@ -103,7 +137,10 @@ export function addKeepResourcePolicyToCrdManifest(manifest: string): string {
       && index < end
       && /^\s+helm\.sh\/resource-policy\s*:/.test(line)
     ));
-    if (policyIndex >= 0) return document;
+    if (policyIndex >= 0) {
+      lines[policyIndex] = '    helm.sh/resource-policy: keep';
+      return lines.join('\n');
+    }
 
     const annotationsIndex = lines.findIndex((line, index) => (
       index > metadataIndex && index < end && /^  annotations:\s*$/.test(line)
@@ -115,6 +152,45 @@ export function addKeepResourcePolicyToCrdManifest(manifest: string): string {
     }
     return lines.join('\n');
   }).join('');
+}
+
+
+export function getCrdRetentionProblems(manifest: string, requiredNames: string[] = []): string[] {
+  const policies = new Map<string, unknown>();
+  try {
+    for (const document of loadAll(manifest)) {
+      if (!document || typeof document !== 'object' || Array.isArray(document)) continue;
+      const resource = document as Record<string, unknown>;
+      if (resource.kind !== 'CustomResourceDefinition') continue;
+      const metadata = resource.metadata;
+      if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+        throw new Error('CustomResourceDefinition has no metadata map');
+      }
+      const metadataRecord = metadata as Record<string, unknown>;
+      if (typeof metadataRecord.name !== 'string' || !metadataRecord.name.trim()) {
+        throw new Error('CustomResourceDefinition has no metadata.name');
+      }
+      const name = metadataRecord.name.trim();
+      if (policies.has(name)) throw new Error('Duplicate CustomResourceDefinition ' + name);
+      const annotations = metadataRecord.annotations;
+      const annotationRecord = annotations && typeof annotations === 'object' && !Array.isArray(annotations)
+        ? annotations as Record<string, unknown>
+        : {};
+      policies.set(name, annotationRecord['helm.sh/resource-policy']);
+    }
+  } catch (error) {
+    return ['Unable to parse Helm release manifest: ' + (error instanceof Error ? error.message : String(error))];
+  }
+
+  const problems = Array.from(policies.entries())
+    .filter(([, policy]) => policy !== 'keep')
+    .map(([name]) => 'CustomResourceDefinition ' + name + ' is not marked helm.sh/resource-policy=keep');
+  for (const name of requiredNames) {
+    if (!policies.has(name)) {
+      problems.push('CustomResourceDefinition ' + name + ' is missing from the Helm release manifest');
+    }
+  }
+  return problems;
 }
 
 function valuesToSetJsonCommandArgs(values: Record<string, unknown>): string[] {
@@ -193,7 +269,8 @@ class HelmService {
   private async execute(
     args: string[],
     onStream?: StreamCallback,
-    timeoutMs: number = 300000 // 5 minutes default timeout
+    timeoutMs: number = 300000, // 5 minutes default timeout
+    envOverrides?: Record<string, string>
   ): Promise<HelmResult> {
     return new Promise((resolve) => {
       let stdout = '';
@@ -205,7 +282,7 @@ class HelmService {
       logger.info({ command: fullCommand, timeoutMs }, `Executing helm command`);
 
       const proc = spawn(this.helmPath, args, {
-        env: { ...process.env },
+        env: { ...process.env, ...envOverrides },
         shell: false,
       });
 
@@ -477,16 +554,17 @@ class HelmService {
   }
 
   private buildKeepCrdPostRendererCommand(installCommand: string, rendererVar: string): string {
-    const rendererRef = `$${rendererVar}`;
+    const rendererRef = '$' + rendererVar;
+    const scriptRef = rendererRef + '/keep-crd-resources.js';
     return [
-      `(${rendererVar}=$(mktemp)`,
+      '(' + rendererVar + '=$(mktemp -d)',
       'set -e',
-      `trap 'rm -f -- "${rendererRef}"' EXIT`,
-      `cat > "${rendererRef}" <<'AIRUNWAY_KEEP_CRD_POST_RENDERER'`,
-      `#!/usr/bin/env node\n${KEEP_CRD_POST_RENDERER_SOURCE}`,
+      'trap ' + shellQuote('rm -rf -- "' + rendererRef + '"') + ' EXIT',
+      'cat > "' + scriptRef + '" <<\'AIRUNWAY_KEEP_CRD_POST_RENDERER\'',
+      '#!/usr/bin/env node\n' + KEEP_CRD_POST_RENDERER_SOURCE,
       'AIRUNWAY_KEEP_CRD_POST_RENDERER',
-      `chmod +x "${rendererRef}"`,
-      `${installCommand} --post-renderer "${rendererRef}")`,
+      'chmod +x "' + scriptRef + '"',
+      installCommand + ' --post-renderer "' + scriptRef + '")',
     ].join('\n');
   }
 
@@ -511,6 +589,42 @@ class HelmService {
           `${varPrefix}_KEEP_CRD_POST_RENDERER`,
         )
       : installCommand;
+    const renderedRef = chartDirRef + '/airunway-rendered.yaml';
+    const subchartCrdDirRef = chartDirRef + '/subchart-crds';
+    const templateCommand = [
+      'helm template',
+      shellQuote(chart.name),
+      '"' + chartPathRef + '"',
+      '--include-crds',
+      '--namespace',
+      shellQuote(chart.namespace),
+      ...valuesToSetJsonArgs(chart.values || {}).map(shellQuote),
+    ].join(' ');
+    const awkProgram = [
+      'function flush() {',
+      '  if (source ~ /(^|\\/)charts\\/.*\\/crds\\/[^/]+\\.ya?ml$/ && document ~ /(^|\\n)kind:[[:space:]]*CustomResourceDefinition([[:space:]]|$)/) {',
+      '    output = sprintf("%s/crd-%04d.yaml", outputDir, count++);',
+      '    print document > output;',
+      '    close(output);',
+      '  }',
+      '}',
+      '/^# Source:/ { source = $0; document = $0 "\\n"; next }',
+      '/^---[[:space:]]*$/ { flush(); document = source "\\n" $0 "\\n"; next }',
+      '{ document = document $0 "\\n" }',
+      'END { flush() }',
+    ].join('\n');
+    const subchartCrdCommands = chart.includeSubchartCrds
+      ? [
+          templateCommand + ' > "' + renderedRef + '"',
+          'mkdir -p "' + subchartCrdDirRef + '" && awk -v outputDir="' + subchartCrdDirRef
+            + '" ' + shellQuote(awkProgram) + ' "' + renderedRef + '"',
+          'for crd in "' + subchartCrdDirRef + '/"*.yaml; do if [ -f "$crd" ]; then missing=0; '
+            + 'crd_names=$(kubectl create --dry-run=client -f "$crd" -o name) || exit $?; '
+            + 'for crd_name in $crd_names; do existing=$(kubectl get "$crd_name" --ignore-not-found -o name) || exit $?; '
+            + 'if [ -z "$existing" ]; then missing=1; fi; done; if [ "$missing" = "1" ]; then '
+            + 'kubectl apply --server-side --force-conflicts -f "$crd" || exit $?; fi; fi; done',
+        ]
+      : [];
 
     return [
       `(${chartDirVar}=$(mktemp -d)`,
@@ -520,6 +634,7 @@ class HelmService {
       `${chartPathVar}=$(find "${chartDirRef}" -mindepth 1 -maxdepth 1 -type d -print -quit)`,
       `test -n "${chartPathRef}"`,
       `for crd in "${chartPathRef}/crds/"*.yaml "${chartPathRef}/crds/"*.yml; do if [ -f "$crd" ]; then missing=0; crd_names=$(kubectl create --dry-run=client -f "$crd" -o name) || exit $?; for crd_name in $crd_names; do existing=$(kubectl get "$crd_name" --ignore-not-found -o name) || exit $?; if [ -z "$existing" ]; then missing=1; fi; done; if [ "$missing" = "1" ]; then kubectl apply --server-side --force-conflicts -f "$crd" || exit $?; fi; fi; done`,
+      ...subchartCrdCommands,
       `${installWithPostRenderer})`,
     ].join(' && ');
   }
@@ -534,23 +649,34 @@ class HelmService {
   }
 
   private createKeepCrdPostRenderer(tempDir: string): string {
+    const compiled = import.meta.dir.includes('/$bunfs/') || process.env.BUN_SELF_EXECUTABLE !== undefined;
     const scriptPath = join(tempDir, 'keep-crd-resources.js');
-    writeFileSync(scriptPath, `#!/usr/bin/env node\n${KEEP_CRD_POST_RENDERER_SOURCE}`, 'utf8');
+    const rendererPath = join(tempDir, process.platform === 'win32' ? 'keep-crd-resources.cmd' : 'keep-crd-resources');
 
-    if (process.platform === 'win32') {
-      const wrapperPath = join(tempDir, 'keep-crd-resources.cmd');
-      writeFileSync(wrapperPath, `@echo off\r\n"${process.execPath}" "${scriptPath}"\r\n`, 'utf8');
-      return wrapperPath;
+    if (!compiled) {
+      writeFileSync(
+        scriptPath,
+        '#!/usr/bin/env node\n' + KEEP_CRD_POST_RENDERER_SOURCE,
+        'utf8',
+      );
     }
 
-    const wrapperPath = join(tempDir, 'keep-crd-resources.sh');
-    writeFileSync(
-      wrapperPath,
-      `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(scriptPath)}\n`,
-      'utf8',
-    );
-    chmodSync(wrapperPath, 0o755);
-    return wrapperPath;
+    if (process.platform === 'win32') {
+      writeFileSync(
+        rendererPath,
+        '@echo off\r\n"' + process.execPath + '"' + (compiled ? '' : ' "' + scriptPath + '"') + ' %*\r\n',
+        'utf8',
+      );
+    } else {
+      writeFileSync(
+        rendererPath,
+        '#!/bin/sh\nexec ' + shellQuote(process.execPath) + (compiled ? '' : ' ' + shellQuote(scriptPath)) + '\n',
+        'utf8',
+      );
+      chmodSync(rendererPath, 0o755);
+    }
+
+    return rendererPath;
   }
 
   private async pullChartToTempDir(
@@ -600,16 +726,19 @@ class HelmService {
 
   private async getChartCrdDocuments(
     chartPath: string,
+    chart: HelmChart,
   ): Promise<{ success: boolean; documents: ChartCrdDocument[]; result?: HelmResult }> {
     const crdsPath = join(chartPath, 'crds');
-    if (!existsSync(crdsPath)) {
+    if (!existsSync(crdsPath) && !chart.includeSubchartCrds) {
       return { success: true, documents: [] };
     }
 
     try {
-      const crdFiles = readdirSync(crdsPath, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && /\.(yaml|yml)$/i.test(entry.name))
-        .sort((a, b) => a.name.localeCompare(b.name));
+      const crdFiles = existsSync(crdsPath)
+        ? readdirSync(crdsPath, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && /\.(yaml|yml)$/i.test(entry.name))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        : [];
       const crdDocuments = new Map<string, ChartCrdDocument>();
 
       for (const crdFile of crdFiles) {
@@ -624,6 +753,24 @@ class HelmService {
             name: metadata.name,
             manifest: dump(document, { noRefs: true }),
           });
+        }
+      }
+
+      if (chart.includeSubchartCrds) {
+        const templateResult = await this.execute([
+          'template',
+          chart.name,
+          chartPath,
+          '--include-crds',
+          '--namespace',
+          chart.namespace,
+          ...valuesToSetJsonArgs(chart.values || {}),
+        ]);
+        if (!templateResult.success) {
+          return { success: false, documents: [], result: templateResult };
+        }
+        for (const document of getSubchartCrdDocumentsFromTemplate(templateResult.stdout)) {
+          if (!crdDocuments.has(document.name)) crdDocuments.set(document.name, document);
         }
       }
 
@@ -649,7 +796,7 @@ class HelmService {
     onStream?: StreamCallback
   ): Promise<{ success: boolean; results: Array<{ step: string; result: HelmResult }> }> {
     const results: Array<{ step: string; result: HelmResult }> = [];
-    const crdPreparation = await this.getChartCrdDocuments(chartPath);
+    const crdPreparation = await this.getChartCrdDocuments(chartPath, chart);
     if (!crdPreparation.success) {
       results.push({
         step: `render-chart-crds-${chart.name}`,
@@ -762,7 +909,16 @@ class HelmService {
     logger.info({ chart: chart.name, namespace: chart.namespace, version: chart.version, values: chart.values, skipCrds: chart.skipCrds }, `Installing helm chart: ${chart.name}`);
 
     try {
-      return await this.execute(args, onStream);
+      return await this.execute(
+        args,
+        onStream,
+        300000,
+        chart.keepCrdResources && postRendererDir
+          ? {
+              AIRUNWAY_HELM_POST_RENDERER: 'keep-crd-resources',
+            }
+          : undefined,
+      );
     } finally {
       if (postRendererDir) {
         rmSync(postRendererDir, { recursive: true, force: true });
@@ -804,9 +960,45 @@ class HelmService {
   async uninstall(
     releaseName: string,
     namespace: string,
-    onStream?: StreamCallback
+    optionsOrStream?: HelmUninstallOptions | StreamCallback,
+    onStream?: StreamCallback,
   ): Promise<HelmResult> {
-    return this.execute(['uninstall', releaseName, '--namespace', namespace, '--wait'], onStream);
+    const options = typeof optionsOrStream === 'function' ? {} : optionsOrStream;
+    const stream = typeof optionsOrStream === 'function' ? optionsOrStream : onStream;
+
+    if (options?.requireKeptCrdResources) {
+      const manifestResult = await this.execute(
+        ['get', 'manifest', releaseName, '--namespace', namespace],
+        stream,
+      );
+      if (!manifestResult.success) {
+        return {
+          ...manifestResult,
+          success: false,
+          stderr: 'Refusing to uninstall release ' + releaseName + ' in namespace ' + namespace
+            + ': unable to verify retained CRDs (' + (manifestResult.stderr || manifestResult.stdout || 'helm get manifest failed')
+            + '). No uninstall was attempted.',
+          exitCode: manifestResult.exitCode ?? 1,
+        };
+      }
+
+      const problems = getCrdRetentionProblems(
+        manifestResult.stdout,
+        options.requiredKeptCrdNames || [],
+      );
+      if (problems.length > 0) {
+        return {
+          success: false,
+          stdout: manifestResult.stdout,
+          stderr: 'Refusing to uninstall release ' + releaseName + ' in namespace ' + namespace
+            + ': ' + problems.join('; ') + '. No uninstall was attempted. '
+            + 'Upgrade the release with the current installation profile before retrying.',
+          exitCode: 1,
+        };
+      }
+    }
+
+    return this.execute(['uninstall', releaseName, '--namespace', namespace, '--wait'], stream);
   }
 
   /**
