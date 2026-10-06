@@ -43,7 +43,6 @@ const (
 
 	// HeartbeatInterval is the interval for updating the provider heartbeat
 	HeartbeatInterval = 1 * time.Minute
-
 )
 
 //go:embed installation-values.json

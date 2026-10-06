@@ -124,9 +124,9 @@ func TestGetInstallationInfo(t *testing.T) {
 		t.Fatalf("expected valid installation values JSON: %v", err)
 	}
 	expectedValues := map[string]any{
-		"featureGates":          map[string]bool{"disableNodeAutoProvisioning": true},
-		"nvidiaDevicePlugin":    map[string]bool{"enabled": false},
-		"localCSIDriver":        map[string]bool{"useLocalCSIDriver": false},
+		"featureGates":       map[string]bool{"disableNodeAutoProvisioning": true},
+		"nvidiaDevicePlugin": map[string]bool{"enabled": false},
+		"localCSIDriver":     map[string]bool{"useLocalCSIDriver": false},
 		"gpu-feature-discovery": map[string]any{
 			"nfd": map[string]bool{"enabled": false},
 			"gfd": map[string]bool{"enabled": false},
